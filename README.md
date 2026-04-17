@@ -6,7 +6,7 @@ A collection of reusable skill references for Claude Code, organized by topic.
 
 | File | Description |
 |---|---|
-| [SSH.md](SSH.md) | SSH setup, key management, and remote command execution on Windows |
+| [ssh/SKILL.md](ssh/SKILL.md) | SSH setup, key management, and remote command execution on Windows |
 
 ## Usage
 
