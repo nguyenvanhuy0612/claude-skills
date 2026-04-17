@@ -1,3 +1,9 @@
+---
+name: ssh
+description: "Use this skill whenever the user wants to set up SSH on a remote Windows machine, configure passwordless login via SSH keys, or run commands on a remote machine over SSH. Triggers include: any mention of 'SSH', 'remote execution', 'passwordless login', 'OpenSSH', or requests to deploy, restart, or manage processes on a remote Windows host. Also use when the task requires running a command in an interactive user session (Session 0 workaround) via Task Scheduler. Do NOT use for Linux/Mac SSH server setup, general networking, or non-SSH remote protocols."
+license: MIT
+---
+
 # SSH Skill
 
 A skill for setting up OpenSSH on a remote Windows machine, managing SSH keys for passwordless login, and executing commands remotely — including commands that require an interactive user session via Task Scheduler.
