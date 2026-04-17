@@ -55,6 +55,8 @@ ssh-keygen -R <windows-machine-ip>
 
 Windows SSH uses `C:\ProgramData\ssh\administrators_authorized_keys` (not `~/.ssh/authorized_keys`) for administrator accounts. The file requires strict ACLs — only `Administrators` and `SYSTEM` may have access, otherwise OpenSSH silently ignores it.
 
+### From a Linux/Mac client (sshpass available)
+
 Run this once from the client machine. It generates a key if missing, then pushes the public key to the Windows machine idempotently (no duplicate entries) and fixes ACLs:
 
 ```bash
@@ -74,6 +76,72 @@ if (-not \$content -or -not \$content.Contains('$PUB_KEY')) { \
 ssh $TARGET_USER@$TARGET_IP "powershell -Command \"$REMOTE_CMD\""
 ssh $TARGET_USER@$TARGET_IP "echo SSH key installed"
 ```
+
+### From a Windows client (no sshpass — use Posh-SSH)
+
+`sshpass` is not available on Windows. Use the **Posh-SSH** PowerShell module instead, which handles password-authenticated SSH natively. Run this from `pwsh` (PowerShell 7):
+
+```powershell
+# Install Posh-SSH once if needed
+if (-not (Get-Module -ListAvailable -Name Posh-SSH)) {
+    Install-Module -Name Posh-SSH -Force -Scope CurrentUser -Repository PSGallery
+}
+Import-Module Posh-SSH
+
+$targetIP   = "<windows-machine-ip>"
+$targetUser = "<username>"
+$password   = "<password>"
+
+# Generate key if missing
+if (-not (Test-Path "$env:USERPROFILE\.ssh\id_rsa")) {
+    ssh-keygen -t rsa -b 4096 -N '""' -C "$targetUser@$targetIP" -f "$env:USERPROFILE\.ssh\id_rsa"
+}
+$pubKey = (Get-Content "$env:USERPROFILE\.ssh\id_rsa.pub" -Raw).Trim()
+
+$pass    = ConvertTo-SecureString $password -AsPlainText -Force
+$cred    = New-Object System.Management.Automation.PSCredential($targetUser, $pass)
+$session = New-SSHSession -ComputerName $targetIP -Credential $cred -AcceptKey -Force
+
+# Detect remote OS: 'ver' returns Windows version string; on Linux it fails/returns nothing
+$osCheck     = Invoke-SSHCommand -SessionId $session.SessionId -Command "ver" -TimeOut 10
+$remoteIsWin = $osCheck.Output -match "Windows"
+
+if ($remoteIsWin) {
+    # Windows: write to administrators_authorized_keys and fix ACLs
+    $script = @"
+`$path = 'C:\ProgramData\ssh\administrators_authorized_keys'
+if (-not (Test-Path `$path)) { New-Item -Path `$path -Force | Out-Null }
+`$content = Get-Content -Path `$path -Raw -ErrorAction SilentlyContinue
+if (-not `$content -or -not `$content.Contains('$pubKey')) {
+    Add-Content -Path `$path -Value '$pubKey' -Encoding Ascii -Force
+    Write-Host 'Key added'
+} else { Write-Host 'Key already present' }
+icacls `$path /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F'
+"@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($script))
+    $r = Invoke-SSHCommand -SessionId $session.SessionId -Command "powershell -EncodedCommand $encoded" -TimeOut 30
+} else {
+    # Linux: standard authorized_keys
+    $cmds = @(
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh",
+        "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys",
+        "grep -qxF '$pubKey' ~/.ssh/authorized_keys || echo '$pubKey' >> ~/.ssh/authorized_keys"
+    )
+    foreach ($cmd in $cmds) {
+        Invoke-SSHCommand -SessionId $session.SessionId -Command $cmd -TimeOut 15 | Out-Null
+    }
+}
+
+$r.Output
+Remove-SSHSession -SessionId $session.SessionId | Out-Null
+Write-Host "Done — test with: ssh $targetUser@$targetIP"
+```
+
+**Key notes for the Windows-client approach:**
+- `$IsWindows` is a reserved read-only variable in PowerShell — always use a different name (e.g. `$remoteIsWin`) for OS detection results.
+- Use `ver` (not `echo`) to detect remote OS: `ver` returns a Windows version string on Windows and fails/returns nothing on Linux.
+- Use Base64-encoded `-EncodedCommand` for the remote PowerShell script to avoid shell escaping issues with quotes and backslashes.
+- The CLIXML blob in `$r.Error` is normal PowerShell progress serialization — check `$r.Output` for actual results.
 
 ## Running Commands Remotely
 
@@ -142,8 +210,8 @@ To set a window title for later identification (e.g. to kill by title), prepend 
 
 ## Critical Rules Summary
 
-Use `administrators_authorized_keys` not `authorized_keys` for Windows administrator accounts. Always fix ACLs on that file with `icacls /inheritance:r /grant Administrators:F /grant SYSTEM:F` — OpenSSH silently ignores the file if permissions are too permissive. Use Base64-encoded commands for any script longer than a few lines to avoid shell escaping issues. Never use `Start-Process` over SSH to launch visible windows — it will silently fail in Session 0. Always use Task Scheduler with `LogonType Interactive` for commands that need the user's desktop session. Use `explorer.exe` process owner to reliably identify the active interactive user. Always unregister the Scheduled Task after launching to avoid leftover task entries.
+Use `administrators_authorized_keys` not `authorized_keys` for Windows administrator accounts. Always fix ACLs on that file with `icacls /inheritance:r /grant Administrators:F /grant SYSTEM:F` — OpenSSH silently ignores the file if permissions are too permissive. Use Base64-encoded commands for any script longer than a few lines to avoid shell escaping issues. Never use `Start-Process` over SSH to launch visible windows — it will silently fail in Session 0. Always use Task Scheduler with `LogonType Interactive` for commands that need the user's desktop session. Use `explorer.exe` process owner to reliably identify the active interactive user. Always unregister the Scheduled Task after launching to avoid leftover task entries. On Windows clients, use Posh-SSH instead of sshpass (which is not available on Windows). Never use `$IsWindows` as a variable name — it is read-only in PowerShell. Use `ver` to detect remote Windows vs Linux over SSH.
 
 ## Dependencies
 
-Requires Win32-OpenSSH on the Windows target (downloaded automatically by the install script), PowerShell 5.1 or later on the Windows machine, and `iconv` on the client machine for Base64 encoding.
+Requires Win32-OpenSSH on the Windows target (downloaded automatically by the install script), PowerShell 5.1 or later on the Windows machine, and `iconv` on the client machine for Base64 encoding. For pushing keys from a Windows client: Posh-SSH module (`Install-Module Posh-SSH`) and PowerShell 7 (`pwsh`).
