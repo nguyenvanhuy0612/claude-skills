@@ -13,8 +13,8 @@ Covers three operations — **install**, **passwordless login** (with stale key 
 | Client → Target | Install | Passwordless | Run Command |
 |---|---|---|---|
 | Mac → Mac | systemsetup | ssh-copy-id (.sh) | bash over SSH |
-| Mac → Windows | PS1 over SSH | ssh-passwordless.sh | powershell over SSH |
-| Windows → Windows | install-openssh.ps1 | ssh-passwordless.ps1 | powershell over SSH |
+| Mac → Windows | PS1 over SSH | passwordless.sh | powershell over SSH |
+| Windows → Windows | install.ps1 | ssh-passwordless.ps1 | powershell over SSH |
 | Windows → Mac | systemsetup (manual) | ssh-passwordless.ps1 | ssh from PowerShell |
 
 ### Authorized keys file per target
@@ -40,7 +40,7 @@ mkdir -p ~/.ssh && chmod 700 ~/.ssh
 touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
 ```
 
-### Windows target — `install-openssh.ps1`
+### Windows target — `install.ps1`
 
 Pinned to a known-good stable build. To upgrade, update `$VERSION` at the top.
 Run as Administrator on the Windows machine:
@@ -176,11 +176,11 @@ ssh-keygen -R ("[<target-ip>]:<port>")   # non-standard port
 
 ---
 
-### `ssh-passwordless.sh` — Mac/Linux client → any target
+### `passwordless.sh` — Mac/Linux client → any target
 
 ```bash
 #!/usr/bin/env bash
-# Usage: ./ssh-passwordless.sh <target-ip> <username> [port] [mac|windows]
+# Usage: ./passwordless.sh <target-ip> <username> [port] [mac|windows]
 set -euo pipefail
 
 TARGET_IP="${1:?Usage: $0 <ip> <user> [port] [mac|windows]}"
@@ -434,7 +434,7 @@ To target a window for later cleanup: prepend `[Console]::Title = 'MyApp';` to `
 - Never use `Start-Process` over SSH for visible windows on Windows — use Task Scheduler with `LogonType Interactive`.
 - Use `explorer.exe` process owner to identify the active interactive user on Windows.
 - Always unregister Scheduled Tasks after launch to avoid leftover entries.
-- Pin `$VERSION` in `install-openssh.ps1` to a known-good release; update deliberately, not automatically.
+- Pin `$VERSION` in `install.ps1` to a known-good release; update deliberately, not automatically.
 
 ## Dependencies
 
