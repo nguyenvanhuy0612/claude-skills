@@ -178,67 +178,92 @@ ssh-keygen -R ("[<target-ip>]:<port>")   # non-standard port
 
 ### `passwordless.sh` — Mac/Linux client → any target
 
-> **Claude must ask for username and password before running this script if the user has not already provided them.**
+> Run it and follow the prompts (host, user, target OS, password). When driving it headlessly, pass every value as a positional arg so nothing blocks on a prompt.
 
 ```bash
 #!/usr/bin/env bash
-# Usage: ./passwordless.sh <target-ip> <username> [port] [windows|mac|linux] [password]
+# Set up passwordless SSH from this Mac/Linux machine to a remote host.
+#
+# Just run it — you'll be prompted for host, user, password, and target OS:
+#     ./passwordless.sh
+#
+# Or pass any of them up front to skip the matching prompt:
+#     ./passwordless.sh 10.0.0.5 root 22 linux
+#
+# Usage: ./passwordless.sh [host] [user] [port] [windows|mac|linux] [password]
 set -euo pipefail
 
-TARGET_IP="${1:?Usage: $0 <ip> <user> [port] [windows|mac|linux] [password]}"
-TARGET_USER="${2:?}"
+TARGET_HOST="${1:-}"
+TARGET_USER="${2:-}"
 PORT="${3:-22}"
-TARGET_OS="${4:-windows}"
-PASSWORD="${5:-}"       # optional; if supplied, uses SSH_ASKPASS (non-interactive)
+TARGET_OS="${4:-}"
+TARGET_PASS="${5:-}"
 KEY_FILE="$HOME/.ssh/id_ed25519"
 
+# --- Prompt for anything not supplied on the command line ---
+if [ -z "$TARGET_HOST" ]; then
+    read -r -p "Remote host (IP or name): " TARGET_HOST
+    [ -z "$TARGET_HOST" ] && { echo "ERROR: remote host is required." >&2; exit 1; }
+fi
+if [ -z "$TARGET_USER" ]; then
+    read -r -p "Remote username [admin]: " TARGET_USER
+    [ -z "$TARGET_USER" ] && TARGET_USER="admin"
+fi
+if [ -z "$TARGET_OS" ]; then
+    read -r -p "Target OS - windows / mac / linux [linux]: " TARGET_OS
+    [ -z "$TARGET_OS" ] && TARGET_OS="linux"
+fi
 TARGET_OS=$(printf '%s' "$TARGET_OS" | tr '[:upper:]' '[:lower:]')
 case "$TARGET_OS" in
     windows|mac|linux) ;;
     *) printf 'ERROR: invalid target OS "%s" (use windows|mac|linux)\n' "$TARGET_OS" >&2; exit 1 ;;
 esac
-
-# Generate key if missing
-if [ ! -f "$KEY_FILE" ]; then
-    ssh-keygen -t ed25519 -f "$KEY_FILE" -N "" -C "$TARGET_USER@$TARGET_IP"
+if [ -z "$TARGET_PASS" ]; then
+    read -r -s -p "Remote password (leave blank to type it at the SSH prompt): " TARGET_PASS
+    printf '\n'
 fi
 
+# A password means non-interactive auth, which needs sshpass.
+if [ -n "$TARGET_PASS" ] && ! command -v sshpass >/dev/null 2>&1; then
+    echo "ERROR: a password was given but 'sshpass' is not installed." >&2
+    echo "  Install it (macOS: brew install sshpass | Debian/Ubuntu: apt install sshpass)" >&2
+    echo "  or re-run and leave the password blank to type it at the SSH prompt." >&2
+    exit 1
+fi
+
+# run_ssh / run_copy_id: use sshpass when a password is supplied, else plain (interactive).
+run_ssh() {
+    if [ -n "$TARGET_PASS" ]; then sshpass -p "$TARGET_PASS" ssh "$@"; else ssh "$@"; fi
+}
+run_copy_id() {
+    if [ -n "$TARGET_PASS" ]; then sshpass -p "$TARGET_PASS" ssh-copy-id "$@"; else ssh-copy-id "$@"; fi
+}
+
+# --- Generate key if missing ---
+if [ ! -f "$KEY_FILE" ]; then
+    ssh-keygen -t ed25519 -f "$KEY_FILE" -N "" -C "$TARGET_USER@$TARGET_HOST"
+fi
 PUB_KEY=$(cat "$KEY_FILE.pub")
 
-# Clear stale host key
-ssh-keygen -R "$TARGET_IP" 2>/dev/null || true
-ssh-keygen -R "[$TARGET_IP]:$PORT" 2>/dev/null || true
-
-# Set up non-interactive auth via SSH_ASKPASS when password is provided
-ASKPASS_FILE=""
-if [ -n "$PASSWORD" ]; then
-    ASKPASS_FILE=$(mktemp /tmp/ssh_askpass_XXXXXX.sh)
-    printf '#!/bin/sh\necho "%s"\n' "$PASSWORD" > "$ASKPASS_FILE"
-    chmod 700 "$ASKPASS_FILE"
-    export SSH_ASKPASS="$ASKPASS_FILE"
-    export SSH_ASKPASS_REQUIRE="force"
-    export DISPLAY="${DISPLAY:-none}"
-    echo "[INFO] Using SSH_ASKPASS for non-interactive auth."
-else
-    echo "[INFO] No password supplied — SSH will prompt interactively."
-fi
-
-cleanup() { [ -n "$ASKPASS_FILE" ] && rm -f "$ASKPASS_FILE"; }
-trap cleanup EXIT
+# --- Clear stale host keys ---
+ssh-keygen -R "$TARGET_HOST" 2>/dev/null || true
+ssh-keygen -R "[$TARGET_HOST]:$PORT" 2>/dev/null || true
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o PasswordAuthentication=yes -o PubkeyAuthentication=no -p $PORT"
 
 if [ "$TARGET_OS" = "mac" ] || [ "$TARGET_OS" = "linux" ]; then
-    # Unix target (mac/linux): use ssh-copy-id or manual append
-    if command -v ssh-copy-id &>/dev/null && [ -z "$PASSWORD" ]; then
-        ssh-copy-id -i "$KEY_FILE.pub" -p "$PORT" "$TARGET_USER@$TARGET_IP"
+    # Unix target (mac/linux): append the key to ~/.ssh/authorized_keys
+    echo "[INFO] Deploying key to $TARGET_OS target..."
+    if command -v ssh-copy-id >/dev/null 2>&1; then
+        run_copy_id -i "$KEY_FILE.pub" -p "$PORT" "$TARGET_USER@$TARGET_HOST"
     else
         CMD="mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qF '$PUB_KEY' ~/.ssh/authorized_keys 2>/dev/null || echo '$PUB_KEY' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo done"
         # shellcheck disable=SC2086
-        ssh $SSH_OPTS "$TARGET_USER@$TARGET_IP" "$CMD"
+        run_ssh $SSH_OPTS "$TARGET_USER@$TARGET_HOST" "$CMD"
     fi
 else
     # Windows target: deploy via Base64-encoded PowerShell
+    echo "[INFO] Deploying key to windows target..."
     REMOTE_SCRIPT=$(cat <<PSEOF
 \$key  = '$PUB_KEY'
 \$f    = 'C:\ProgramData\ssh\administrators_authorized_keys'
@@ -257,23 +282,25 @@ PSEOF
 )
     ENCODED=$(printf '%s' "$REMOTE_SCRIPT" | iconv -t UTF-16LE | base64 | tr -d '\n')
     # shellcheck disable=SC2086
-    ssh $SSH_OPTS "$TARGET_USER@$TARGET_IP" "powershell -EncodedCommand $ENCODED"
+    run_ssh $SSH_OPTS "$TARGET_USER@$TARGET_HOST" "powershell -EncodedCommand $ENCODED"
 fi
 
-# Test passwordless
+echo "[OK] Key deployed."
+
+# --- Test passwordless login ---
 # Drop stderr (login banners / TMOUT warnings) and match 'ok' loosely,
 # since servers may prepend banner text to stdout.
-echo "Testing passwordless login..."
+echo "[INFO] Testing passwordless login..."
 result=$(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no \
-    -i "$KEY_FILE" -p "$PORT" "$TARGET_USER@$TARGET_IP" "echo ok" 2>/dev/null)
+    -i "$KEY_FILE" -p "$PORT" "$TARGET_USER@$TARGET_HOST" "echo ok" 2>/dev/null)
 
 case "$result" in
     *ok*)
-        echo "[OK] Passwordless works: ssh -i $KEY_FILE -p $PORT $TARGET_USER@$TARGET_IP"
+        echo "[OK] Passwordless works: ssh -i $KEY_FILE -p $PORT $TARGET_USER@$TARGET_HOST"
         ;;
     *)
         echo "[WARN] Test returned: $result"
-        echo "Try: ssh -i $KEY_FILE -p $PORT $TARGET_USER@$TARGET_IP"
+        echo "  Try: ssh -i $KEY_FILE -p $PORT $TARGET_USER@$TARGET_HOST"
         ;;
 esac
 ```
@@ -282,42 +309,56 @@ esac
 
 ### `ssh-passwordless.ps1` — Windows client → any target
 
-> **Claude must ask for `-RemoteUser` and `-RemotePassword` before running this script if the user has not already provided them.**
+> Run it and follow the prompts (host, user, target OS, password). When driving it headlessly, pass every value as a `-Param` so nothing blocks on a prompt.
 
 ```powershell
-# Usage: .\ssh-passwordless.ps1 -RemoteHost <ip> [-RemoteUser admin] [-RemotePassword <pw>] [-Port 22] [-TargetOS windows|mac|linux]
+# Set up passwordless SSH from this Windows machine to a remote host.
+#
+# Just run it — you'll be prompted for host, user, password, and target OS:
+#     .\passwordless.ps1
+#
+# Or pass any of them up front to skip the matching prompt:
+#     .\passwordless.ps1 -RemoteHost 10.0.0.5 -RemoteUser root -TargetOS linux
+#
+# Usage: .\passwordless.ps1 [-RemoteHost <ip>] [-RemoteUser <user>] [-RemotePassword <pw>] [-Port 22] [-TargetOS windows|mac|linux]
 param(
-    [Parameter(Mandatory)][string]$RemoteHost,
-    [string]$RemoteUser     = "",        # if empty, prompt (Enter = admin)
-    [string]$RemotePassword = "",        # if supplied, uses SSH_ASKPASS (non-interactive)
+    [string]$RemoteHost     = "",
+    [string]$RemoteUser     = "",
+    [string]$RemotePassword = "",
     [int]$Port              = 22,
-    [ValidateSet("windows","mac","linux","")][string]$TargetOS = ""   # if empty, prompt
+    [ValidateSet("windows","mac","linux","")][string]$TargetOS = ""
 )
 
 $ErrorActionPreference = "Stop"
 $KEY_FILE = "$env:USERPROFILE\.ssh\id_ed25519"
 
-# Prompt for the remote username if not supplied on the command line
+function ok($t)   { Write-Host "  [OK]   $t" -ForegroundColor Green }
+function info($t) { Write-Host "  [INFO] $t" -ForegroundColor Cyan }
+function err($t)  { Write-Host "  [ERR]  $t" -ForegroundColor Red; exit 1 }
+
+# --- Prompt for anything not supplied on the command line ---
+if ([string]::IsNullOrWhiteSpace($RemoteHost)) {
+    $RemoteHost = Read-Host "Remote host (IP or name)"
+    if ([string]::IsNullOrWhiteSpace($RemoteHost)) { err "Remote host is required." }
+}
 if ([string]::IsNullOrWhiteSpace($RemoteUser)) {
     $RemoteUser = Read-Host "Remote username [admin]"
     if ([string]::IsNullOrWhiteSpace($RemoteUser)) { $RemoteUser = "admin" }
 }
-
-# Prompt for the target OS if not supplied (avoids silently defaulting to windows)
 if ([string]::IsNullOrWhiteSpace($TargetOS)) {
     $TargetOS = Read-Host "Target OS - windows / mac / linux [linux]"
     if ([string]::IsNullOrWhiteSpace($TargetOS)) { $TargetOS = "linux" }
 }
 $TargetOS = $TargetOS.ToLower()
-if ($TargetOS -notin @("windows","mac","linux")) {
-    Write-Host "  [ERR]  Invalid TargetOS '$TargetOS' (use windows|mac|linux)" -ForegroundColor Red; exit 1
+if ($TargetOS -notin @("windows","mac","linux")) { err "Invalid TargetOS '$TargetOS' (use windows|mac|linux)." }
+if ([string]::IsNullOrWhiteSpace($RemotePassword)) {
+    $sec = Read-Host "Remote password (leave blank to type it at the SSH prompt)" -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+    $RemotePassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
 }
 
-function ok($t)   { Write-Host "  [OK]   $t" -ForegroundColor Green }
-function info($t) { Write-Host "  [INFO] $t" -ForegroundColor Cyan }
-function err($t)  { Write-Host "  [ERR]  $t" -ForegroundColor Red; exit 1 }
-
-# Generate key if missing
+# --- Generate key if missing ---
 if (-not (Test-Path "$KEY_FILE.pub")) {
     info "Generating ed25519 key pair..."
     New-Item -ItemType Directory -Force -Path (Split-Path $KEY_FILE) | Out-Null
@@ -327,15 +368,14 @@ if (-not (Test-Path "$KEY_FILE.pub")) {
 } else {
     ok "Key exists: $KEY_FILE.pub"
 }
-
 $pubKey = (Get-Content "$KEY_FILE.pub").Trim()
 
-# Clear stale host keys
+# --- Clear stale host keys ---
 ssh-keygen -R $RemoteHost 2>&1 | Out-Null
 if ($Port -ne 22) { ssh-keygen -R "[$RemoteHost]:$Port" 2>&1 | Out-Null }
 ok "Cleared known_hosts for $RemoteHost"
 
-# Set up SSH_ASKPASS for non-interactive password auth when password is provided
+# --- Non-interactive password auth via SSH_ASKPASS (when a password was supplied) ---
 $askpassFile = $null
 if ($RemotePassword -ne "") {
     $askpassFile = "$env:TEMP\ssh_askpass_$PID.bat"
@@ -343,9 +383,9 @@ if ($RemotePassword -ne "") {
     $env:SSH_ASKPASS         = $askpassFile
     $env:SSH_ASKPASS_REQUIRE = "force"
     $env:DISPLAY             = "none"   # required by some OpenSSH builds
-    info "Using SSH_ASKPASS for non-interactive auth."
+    info "Using the supplied password (non-interactive)."
 } else {
-    info "No password supplied — SSH will prompt interactively."
+    info "No password supplied - SSH will prompt interactively."
 }
 
 $sshArgs = @("-o","StrictHostKeyChecking=no","-o","PasswordAuthentication=yes",
@@ -359,7 +399,7 @@ try {
                "echo '$pubKey' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo done"
         & ssh @sshArgs $cmd
     } else {
-        info "Deploying key to Windows target..."
+        info "Deploying key to windows target..."
         $remoteScript = @"
 `$key  = '$pubKey'
 `$f    = 'C:\ProgramData\ssh\administrators_authorized_keys'
@@ -380,14 +420,14 @@ Write-Host 'done'
         if ($LASTEXITCODE -ne 0) { err "Deploy failed (exit=$LASTEXITCODE)." }
     }
 } finally {
-    # Always clean up askpass file and env vars
+    # Always clean up the askpass helper and env vars
     if ($askpassFile -and (Test-Path $askpassFile)) { Remove-Item $askpassFile -Force }
     $env:SSH_ASKPASS = $null; $env:SSH_ASKPASS_REQUIRE = $null; $env:DISPLAY = $null
 }
 
 ok "Key deployed."
 
-# Test passwordless
+# --- Test passwordless login ---
 # Drop stderr (login banners / TMOUT warnings) so they don't trip ErrorActionPreference=Stop,
 # and match 'ok' loosely since servers may prepend banner text.
 info "Testing passwordless login..."
@@ -509,8 +549,8 @@ To target a window for later cleanup: prepend `[Console]::Title = 'MyApp';` to `
 
 ## Critical Rules
 
-- **Always ask for credentials first**: Before running any passwordless-setup command, ask the user for `RemoteUser` and `RemotePassword` if they were not already provided. Never launch an SSH command that will block waiting for interactive input — that hangs the background task.
-- **Non-interactive password via SSH_ASKPASS**: On Windows, pass `-RemotePassword` to `ssh-passwordless.ps1`; it creates a temp `.bat` helper, sets `SSH_ASKPASS`/`SSH_ASKPASS_REQUIRE=force`/`DISPLAY=none`, then cleans up in a `finally` block. On Mac/Linux, pass `PASSWORD` as 5th arg to `passwordless.sh`; it does the same with a temp shell script.
+- **Run it and follow the prompts**: both scripts prompt for host, user (Enter = admin), target OS (Enter = linux), and password when those aren't passed as args — so the normal flow is *run → enter creds → success*. When driving them headlessly (background task), pass every value as an arg/param so nothing blocks on a prompt.
+- **Non-interactive password**: On Windows, `passwordless.ps1` takes the password (prompt or `-RemotePassword`), writes a temp `.bat` helper, sets `SSH_ASKPASS`/`SSH_ASKPASS_REQUIRE=force`/`DISPLAY=none`, and cleans up in a `finally` block. On Mac/Linux, `passwordless.sh` uses `sshpass` when a password is given (it errors with an install hint if `sshpass` is missing); leave the password blank to type it at the SSH prompt instead.
 - **Mac**: `authorized_keys` must be `chmod 600`; `~/.ssh` must be `chmod 700` — OpenSSH ignores the file if permissions are too open.
 - **Windows**: use `administrators_authorized_keys` for admin accounts; fix ACLs with `icacls /inheritance:r /grant Administrators:F /grant SYSTEM:F` — OpenSSH silently ignores the file otherwise.
 - Always run `ssh-keygen -R <host>` to clear stale host keys before re-deploying to a reimaged machine.
@@ -524,5 +564,5 @@ To target a window for later cleanup: prepend `[Console]::Title = 'MyApp';` to `
 
 - **Mac target**: built-in OpenSSH (no install needed).
 - **Windows target**: Win32-OpenSSH pinned build (downloaded by install script), PowerShell 5.1+.
-- **Mac/Linux client**: `iconv`, `ssh-copy-id` (pre-installed on macOS/Linux).
+- **Mac/Linux client**: `iconv`, `ssh-copy-id` (pre-installed on macOS/Linux); `sshpass` only if you want to pass a password non-interactively (macOS: `brew install sshpass`; Debian/Ubuntu: `apt install sshpass`).
 - **Windows client**: built-in `ssh` / `ssh-keygen` (available since Windows 10 1809); PowerShell 5.1+.
