@@ -182,15 +182,21 @@ ssh-keygen -R ("[<target-ip>]:<port>")   # non-standard port
 
 ```bash
 #!/usr/bin/env bash
-# Usage: ./passwordless.sh <target-ip> <username> [port] [mac|windows] [password]
+# Usage: ./passwordless.sh <target-ip> <username> [port] [windows|mac|linux] [password]
 set -euo pipefail
 
-TARGET_IP="${1:?Usage: $0 <ip> <user> [port] [mac|windows] [password]}"
+TARGET_IP="${1:?Usage: $0 <ip> <user> [port] [windows|mac|linux] [password]}"
 TARGET_USER="${2:?}"
 PORT="${3:-22}"
 TARGET_OS="${4:-windows}"
 PASSWORD="${5:-}"       # optional; if supplied, uses SSH_ASKPASS (non-interactive)
 KEY_FILE="$HOME/.ssh/id_ed25519"
+
+TARGET_OS=$(printf '%s' "$TARGET_OS" | tr '[:upper:]' '[:lower:]')
+case "$TARGET_OS" in
+    windows|mac|linux) ;;
+    *) printf 'ERROR: invalid target OS "%s" (use windows|mac|linux)\n' "$TARGET_OS" >&2; exit 1 ;;
+esac
 
 # Generate key if missing
 if [ ! -f "$KEY_FILE" ]; then
@@ -222,8 +228,8 @@ trap cleanup EXIT
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o PasswordAuthentication=yes -o PubkeyAuthentication=no -p $PORT"
 
-if [ "$TARGET_OS" = "mac" ]; then
-    # Mac target: use ssh-copy-id or manual append
+if [ "$TARGET_OS" = "mac" ] || [ "$TARGET_OS" = "linux" ]; then
+    # Unix target (mac/linux): use ssh-copy-id or manual append
     if command -v ssh-copy-id &>/dev/null && [ -z "$PASSWORD" ]; then
         ssh-copy-id -i "$KEY_FILE.pub" -p "$PORT" "$TARGET_USER@$TARGET_IP"
     else
@@ -255,16 +261,21 @@ PSEOF
 fi
 
 # Test passwordless
+# Drop stderr (login banners / TMOUT warnings) and match 'ok' loosely,
+# since servers may prepend banner text to stdout.
 echo "Testing passwordless login..."
 result=$(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no \
-    -i "$KEY_FILE" -p "$PORT" "$TARGET_USER@$TARGET_IP" "echo ok" 2>&1)
+    -i "$KEY_FILE" -p "$PORT" "$TARGET_USER@$TARGET_IP" "echo ok" 2>/dev/null)
 
-if [ "$result" = "ok" ]; then
-    echo "[OK] Passwordless works: ssh -i $KEY_FILE -p $PORT $TARGET_USER@$TARGET_IP"
-else
-    echo "[WARN] Test returned: $result"
-    echo "Try: ssh -p $PORT $TARGET_USER@$TARGET_IP"
-fi
+case "$result" in
+    *ok*)
+        echo "[OK] Passwordless works: ssh -i $KEY_FILE -p $PORT $TARGET_USER@$TARGET_IP"
+        ;;
+    *)
+        echo "[WARN] Test returned: $result"
+        echo "Try: ssh -i $KEY_FILE -p $PORT $TARGET_USER@$TARGET_IP"
+        ;;
+esac
 ```
 
 ---
@@ -274,17 +285,33 @@ fi
 > **Claude must ask for `-RemoteUser` and `-RemotePassword` before running this script if the user has not already provided them.**
 
 ```powershell
-# Usage: .\ssh-passwordless.ps1 -RemoteHost <ip> [-RemoteUser admin] [-RemotePassword <pw>] [-Port 22] [-TargetOS windows|mac]
+# Usage: .\ssh-passwordless.ps1 -RemoteHost <ip> [-RemoteUser admin] [-RemotePassword <pw>] [-Port 22] [-TargetOS windows|mac|linux]
 param(
     [Parameter(Mandatory)][string]$RemoteHost,
-    [string]$RemoteUser     = "admin",
+    [string]$RemoteUser     = "",        # if empty, prompt (Enter = admin)
     [string]$RemotePassword = "",        # if supplied, uses SSH_ASKPASS (non-interactive)
     [int]$Port              = 22,
-    [ValidateSet("windows","mac")][string]$TargetOS = "windows"
+    [ValidateSet("windows","mac","linux","")][string]$TargetOS = ""   # if empty, prompt
 )
 
 $ErrorActionPreference = "Stop"
 $KEY_FILE = "$env:USERPROFILE\.ssh\id_ed25519"
+
+# Prompt for the remote username if not supplied on the command line
+if ([string]::IsNullOrWhiteSpace($RemoteUser)) {
+    $RemoteUser = Read-Host "Remote username [admin]"
+    if ([string]::IsNullOrWhiteSpace($RemoteUser)) { $RemoteUser = "admin" }
+}
+
+# Prompt for the target OS if not supplied (avoids silently defaulting to windows)
+if ([string]::IsNullOrWhiteSpace($TargetOS)) {
+    $TargetOS = Read-Host "Target OS - windows / mac / linux [linux]"
+    if ([string]::IsNullOrWhiteSpace($TargetOS)) { $TargetOS = "linux" }
+}
+$TargetOS = $TargetOS.ToLower()
+if ($TargetOS -notin @("windows","mac","linux")) {
+    Write-Host "  [ERR]  Invalid TargetOS '$TargetOS' (use windows|mac|linux)" -ForegroundColor Red; exit 1
+}
 
 function ok($t)   { Write-Host "  [OK]   $t" -ForegroundColor Green }
 function info($t) { Write-Host "  [INFO] $t" -ForegroundColor Cyan }
@@ -325,8 +352,8 @@ $sshArgs = @("-o","StrictHostKeyChecking=no","-o","PasswordAuthentication=yes",
              "-o","PubkeyAuthentication=no","-p",$Port,"${RemoteUser}@${RemoteHost}")
 
 try {
-    if ($TargetOS -eq "mac") {
-        info "Deploying key to Mac target..."
+    if ($TargetOS -eq "mac" -or $TargetOS -eq "linux") {
+        info "Deploying key to $TargetOS target..."
         $cmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && " +
                "grep -qF '$pubKey' ~/.ssh/authorized_keys 2>/dev/null || " +
                "echo '$pubKey' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo done"
@@ -361,16 +388,21 @@ Write-Host 'done'
 ok "Key deployed."
 
 # Test passwordless
+# Drop stderr (login banners / TMOUT warnings) so they don't trip ErrorActionPreference=Stop,
+# and match 'ok' loosely since servers may prepend banner text.
 info "Testing passwordless login..."
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 $result = & ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no `
-    -i $KEY_FILE -p $Port "${RemoteUser}@${RemoteHost}" "echo ok" 2>&1
+    -i $KEY_FILE -p $Port "${RemoteUser}@${RemoteHost}" "echo ok" 2>$null
+$ErrorActionPreference = $prevEAP
 
-if ($result -eq "ok") {
+if ($result -match '\bok\b') {
     ok "Passwordless works."
     Write-Host "  Connect: ssh -i $KEY_FILE -p $Port $RemoteUser@$RemoteHost" -ForegroundColor Cyan
 } else {
     Write-Host "  [WARN] Test returned: $result" -ForegroundColor Yellow
-    Write-Host "  Try: ssh -p $Port $RemoteUser@$RemoteHost"
+    Write-Host "  Try: ssh -i $KEY_FILE -p $Port $RemoteUser@$RemoteHost"
 }
 ```
 

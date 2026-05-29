@@ -1,13 +1,29 @@
-# Usage: .\passwordless.ps1 -RemoteHost <ip> [-RemoteUser admin] [-Port 22] [-TargetOS windows|mac]
+# Usage: .\passwordless.ps1 -RemoteHost <ip> [-RemoteUser admin] [-Port 22] [-TargetOS windows|mac|linux]
 param(
     [Parameter(Mandatory)][string]$RemoteHost,
-    [string]$RemoteUser = "admin",
+    [string]$RemoteUser = "",        # if empty, prompt (Enter = admin)
     [int]$Port          = 22,
-    [ValidateSet("windows","mac")][string]$TargetOS = "windows"
+    [ValidateSet("windows","mac","linux","")][string]$TargetOS = ""   # if empty, prompt
 )
 
 $ErrorActionPreference = "Stop"
 $KEY_FILE = "$env:USERPROFILE\.ssh\id_ed25519"
+
+# Prompt for the remote username if not supplied on the command line
+if ([string]::IsNullOrWhiteSpace($RemoteUser)) {
+    $RemoteUser = Read-Host "Remote username [admin]"
+    if ([string]::IsNullOrWhiteSpace($RemoteUser)) { $RemoteUser = "admin" }
+}
+
+# Prompt for the target OS if not supplied (avoids silently defaulting to windows)
+if ([string]::IsNullOrWhiteSpace($TargetOS)) {
+    $TargetOS = Read-Host "Target OS - windows / mac / linux [linux]"
+    if ([string]::IsNullOrWhiteSpace($TargetOS)) { $TargetOS = "linux" }
+}
+$TargetOS = $TargetOS.ToLower()
+if ($TargetOS -notin @("windows","mac","linux")) {
+    Write-Host "  [ERR]  Invalid TargetOS '$TargetOS' (use windows|mac|linux)" -ForegroundColor Red; exit 1
+}
 
 function ok($t)   { Write-Host "  [OK]   $t" -ForegroundColor Green }
 function info($t) { Write-Host "  [INFO] $t" -ForegroundColor Cyan }
@@ -33,8 +49,8 @@ ok "Cleared known_hosts for $RemoteHost"
 
 $sshArgs = @("-o","StrictHostKeyChecking=no","-p",$Port,"${RemoteUser}@${RemoteHost}")
 
-if ($TargetOS -eq "mac") {
-    info "Deploying key to Mac target (password prompt)..."
+if ($TargetOS -eq "mac" -or $TargetOS -eq "linux") {
+    info "Deploying key to $TargetOS target (password prompt)..."
     $cmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && " +
            "grep -qF '$pubKey' ~/.ssh/authorized_keys 2>/dev/null || " +
            "echo '$pubKey' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo done"
@@ -64,14 +80,19 @@ Write-Host 'done'
 ok "Key deployed."
 
 # Test passwordless
+# Drop stderr (login banners / TMOUT warnings) so they don't trip ErrorActionPreference=Stop,
+# and match 'ok' loosely since servers may prepend banner text.
 info "Testing passwordless login..."
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 $result = & ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no `
-    -i $KEY_FILE -p $Port "${RemoteUser}@${RemoteHost}" "echo ok" 2>&1
+    -i $KEY_FILE -p $Port "${RemoteUser}@${RemoteHost}" "echo ok" 2>$null
+$ErrorActionPreference = $prevEAP
 
-if ($result -eq "ok") {
+if ($result -match '\bok\b') {
     ok "Passwordless works."
     Write-Host "  Connect: ssh -i $KEY_FILE -p $Port $RemoteUser@$RemoteHost" -ForegroundColor Cyan
 } else {
     Write-Host "  [WARN] Test returned: $result" -ForegroundColor Yellow
-    Write-Host "  Try: ssh -p $Port $RemoteUser@$RemoteHost"
+    Write-Host "  Try: ssh -i $KEY_FILE -p $Port $RemoteUser@$RemoteHost"
 }

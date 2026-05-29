@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# Usage: ./ssh_passwordless.sh <target-ip> <username> [port] [mac|windows]
+# Usage: ./ssh_passwordless.sh <target-ip> <username> [port] [windows|mac|linux]
 set -euo pipefail
 
-TARGET_IP="${1:?Usage: $0 <ip> <user> [port] [mac|windows]}"
-TARGET_USER="${2:?Usage: $0 <ip> <user> [port] [mac|windows]}"
+TARGET_IP="${1:?Usage: $0 <ip> <user> [port] [windows|mac|linux]}"
+TARGET_USER="${2:?Usage: $0 <ip> <user> [port] [windows|mac|linux]}"
 PORT="${3:-22}"
 TARGET_OS="${4:-windows}"
 KEY_FILE="$HOME/.ssh/id_ed25519"
+
+TARGET_OS=$(printf '%s' "$TARGET_OS" | tr '[:upper:]' '[:lower:]')
+case "$TARGET_OS" in
+    windows|mac|linux) ;;
+    *) printf 'ERROR: invalid target OS "%s" (use windows|mac|linux)\n' "$TARGET_OS" >&2; exit 1 ;;
+esac
 
 # Generate key if missing
 if [ ! -f "$KEY_FILE" ]; then
@@ -19,7 +25,8 @@ PUB_KEY=$(cat "$KEY_FILE.pub")
 ssh-keygen -R "$TARGET_IP" 2>/dev/null || true
 ssh-keygen -R "[$TARGET_IP]:$PORT" 2>/dev/null || true
 
-if [ "$TARGET_OS" = "mac" ]; then
+if [ "$TARGET_OS" = "mac" ] || [ "$TARGET_OS" = "linux" ]; then
+    # Unix target (mac/linux): ssh-copy-id appends to ~/.ssh/authorized_keys
     ssh-copy-id -i "$KEY_FILE.pub" -p "$PORT" "$TARGET_USER@$TARGET_IP"
 else
     # Windows target: embed key into script then Base64-encode the whole thing
@@ -44,13 +51,18 @@ PSEOF
 fi
 
 # Test passwordless login
+# Drop stderr (login banners / TMOUT warnings) and match 'ok' loosely,
+# since servers may prepend banner text to stdout.
 echo "Testing passwordless login..."
 result=$(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no \
-    -i "$KEY_FILE" -p "$PORT" "$TARGET_USER@$TARGET_IP" "echo ok" 2>&1)
+    -i "$KEY_FILE" -p "$PORT" "$TARGET_USER@$TARGET_IP" "echo ok" 2>/dev/null)
 
-if [ "$result" = "ok" ]; then
-    echo "Success: ssh -i $KEY_FILE -p $PORT $TARGET_USER@$TARGET_IP"
-else
-    echo "WARNING: test returned: $result"
-    echo "Try: ssh -p $PORT $TARGET_USER@$TARGET_IP"
-fi
+case "$result" in
+    *ok*)
+        echo "Success: ssh -i $KEY_FILE -p $PORT $TARGET_USER@$TARGET_IP"
+        ;;
+    *)
+        echo "WARNING: test returned: $result"
+        echo "Try: ssh -i $KEY_FILE -p $PORT $TARGET_USER@$TARGET_IP"
+        ;;
+esac
